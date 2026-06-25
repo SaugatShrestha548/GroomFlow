@@ -161,16 +161,94 @@ function getCarryoverTasks(tasks, today) {
 }
 
 // ─── Notification helpers ─────────────────────────────────────────────────────
+//
+// IMPORTANT PLATFORM LIMITATION:
+// A plain setTimeout() is destroyed the moment the app/tab is closed or the
+// phone locks for long enough — Android Chrome does not keep JS timers alive
+// in the background without a push server. That was the root cause of
+// "notifications don't fire": the old code scheduled a setTimeout and hoped
+// the app stayed open until the target time, which it usually didn't.
+//
+// FIX: instead of relying on a background timer, we check "is today's
+// reminder due / overdue?" every time the app is opened or becomes visible,
+// and fire immediately if so (deduped via gf_last_notif_date so it only
+// fires once per day). We ALSO keep a live setTimeout as a bonus for when
+// the app happens to stay open/foregrounded past the reminder time.
+// This makes the reminder reliable as long as you open the app once a day —
+// which matches what the in-app copy already tells the user.
+
 async function requestNotifPermission() {
   if (!("Notification" in window)) return "unsupported";
   if (Notification.permission==="granted") return "granted";
   if (Notification.permission==="denied")  return "denied";
   return await Notification.requestPermission();
 }
+
 function fireNotification(title, body, icon="/icon-192.png") {
-  if (Notification.permission!=="granted") return;
-  new Notification(title, { body, icon, badge:icon, vibrate:[200,100,200] });
+  if (!("Notification" in window) || Notification.permission!=="granted") return;
+  try {
+    // Prefer firing through the active Service Worker registration when available —
+    // more reliable on Android Chrome than the plain Notification constructor,
+    // especially for PWAs added to the home screen.
+    if ("serviceWorker" in navigator && navigator.serviceWorker.controller) {
+      navigator.serviceWorker.ready.then(reg => {
+        reg.showNotification(title, { body, icon, badge: icon, vibrate: [200,100,200] });
+      });
+    } else {
+      new Notification(title, { body, icon, badge: icon, vibrate: [200,100,200] });
+    }
+  } catch (e) {
+    // Some browsers throw if Notification is constructed directly inside a PWA context
+    try { new Notification(title, { body, icon }); } catch {}
+  }
 }
+
+// Builds the combined routine + deadline notification content for "today"
+function buildDailyNotificationPayload(tasks, deadlines, today) {
+  const due = tasks.filter(t => isDueOn(t, today));
+  const urgentDeadlines = deadlines.filter(d => !d.done && daysUntilDeadline(d.date, today) <= 7);
+  return { due, urgentDeadlines };
+}
+
+// Fires the once-per-day routine + deadline notifications, deduped by date
+function fireDailyNotificationsIfDue(tasks, deadlines) {
+  const today = new Date();
+  const todayStr = toDateStr(today);
+  const lastFired = ls.get("gf_last_notif_date", null);
+  if (lastFired === todayStr) return; // already fired today — avoid duplicates
+
+  const { due, urgentDeadlines } = buildDailyNotificationPayload(tasks, deadlines, today);
+
+  if (due.length > 0) {
+    fireNotification(`GroomFlow — ${due.length} routine${due.length>1?"s":""} today`,
+      due.map(t=>`• ${t.name}`).join("\n"));
+  }
+  // Stagger deadline notification slightly so both are visible as separate alerts
+  urgentDeadlines.forEach((dl, i) => {
+    const days = daysUntilDeadline(dl.date, today);
+    setTimeout(() => {
+      fireNotification(`⏰ Deadline: ${dl.title}`, `${dlBadgeLabel(days)} — ${dl.subject||"Assignment"}`);
+    }, 600 * (i + 1));
+  });
+
+  ls.set("gf_last_notif_date", todayStr);
+}
+
+// Checks whether "now" is at/after the reminder time and fires if not already done today.
+// Called on mount, on visibility change (app re-opened/foregrounded), and via the
+// live setTimeout below for same-session accuracy.
+function checkAndFireIfReminderDue(reminderTime, tasks, deadlines) {
+  const [hh, mm] = reminderTime.split(":").map(Number);
+  const now = new Date();
+  const reminderToday = new Date(now);
+  reminderToday.setHours(hh, mm, 0, 0);
+  if (now >= reminderToday) {
+    fireDailyNotificationsIfDue(tasks, deadlines);
+  }
+}
+
+// Live timer for same-session firing exactly at the reminder time (best-effort —
+// only works while the app/tab stays open). Re-arms itself for the next day.
 function scheduleDailyReminder(timeStr, tasks, deadlines) {
   const [hh,mm] = timeStr.split(":").map(Number);
   const now = new Date();
@@ -178,17 +256,11 @@ function scheduleDailyReminder(timeStr, tasks, deadlines) {
   target.setHours(hh,mm,0,0);
   if (target<=now) target.setDate(target.getDate()+1);
   return setTimeout(()=>{
-    const today = new Date();
-    const due = tasks.filter(t=>isDueOn(t,today));
-    if (due.length>0) fireNotification(`GroomFlow — ${due.length} routine${due.length>1?"s":""} today`, due.map(t=>`• ${t.name}`).join("\n"));
-    deadlines.forEach(dl => {
-      if (dl.done) return;
-      const days = daysUntilDeadline(dl.date, today);
-      if (days <= 7) fireNotification(`⏰ Deadline: ${dl.title}`, `${dlBadgeLabel(days)} — ${dl.subject||"Assignment"}`);
-    });
+    fireDailyNotificationsIfDue(tasks, deadlines);
     scheduleDailyReminder(timeStr, tasks, deadlines);
   }, target - now);
 }
+
 
 // ─── UI Atoms ─────────────────────────────────────────────────────────────────
 function ProgressRing({pct,size=88,stroke=7}) {
@@ -316,31 +388,47 @@ function DeadlineTab({deadlines,onAdd,onEdit,onDelete,onToggleDone,today}) {
 }
 
 // ─── Deadline strip for Today tab ─────────────────────────────────────────────
-// FIX: each item gets its own computed `days` value — no shared variable
+// FIX 1 (closure bug): each item computes its own `daysLeft` value — no shared variable.
+// FIX 2 (dashboard flooding): cap visible cards at 3. If more exist, show a single
+// compact "+N more" pill instead of stacking unlimited cards that push the rest
+// of the dashboard down and visually overwhelm the Today tab.
 function DeadlineStrip({deadlines,today}) {
   const urgent = deadlines
     .filter(d => !d.done && daysUntilDeadline(d.date,today) <= 7)
     .sort((a,b) => daysUntilDeadline(a.date,today) - daysUntilDeadline(b.date,today));
   if (urgent.length===0) return null;
+
+  const MAX_VISIBLE = 3;
+  const visible  = urgent.slice(0, MAX_VISIBLE);
+  const overflow = urgent.length - visible.length;
+
   return (
     <div>
-      <p style={{fontSize:10,color:"#555",textTransform:"uppercase",letterSpacing:"0.1em",paddingLeft:2,marginBottom:8}}>Deadlines this week</p>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8,paddingLeft:2,paddingRight:2}}>
+        <p style={{fontSize:10,color:"#555",textTransform:"uppercase",letterSpacing:"0.1em"}}>Deadlines this week</p>
+        {urgent.length>0&&<span style={{fontSize:10,color:"#666"}}>{urgent.length} total</span>}
+      </div>
       <div style={{display:"flex",flexDirection:"column",gap:6}}>
-        {urgent.map(dl => {
-          // FIX: compute days independently inside the map — was a shared closure bug before
+        {visible.map(dl => {
+          // Computed fresh per item — fixes the old shared-variable closure bug
           const daysLeft = daysUntilDeadline(dl.date, today);
           const c = DL_COLORS[dlColorKey(daysLeft)];
           return (
-            <div key={dl.id} style={{display:"flex",alignItems:"center",gap:12,padding:"12px 14px",borderRadius:14,background:c.bg,border:`1px solid ${c.ring}40`}}>
-              <AlertTriangle size={15} color={c.ring} style={{flexShrink:0}}/>
-              <div style={{flex:1,minWidth:0}}>
-                <p style={{fontSize:13,fontWeight:500,color:"#fff",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{dl.title}</p>
-                {dl.subject&&<p style={{fontSize:10,color:"#666",marginTop:1}}>{dl.subject}</p>}
+            <div key={dl.id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",borderRadius:14,background:c.bg,border:`1px solid ${c.ring}40`,minWidth:0}}>
+              <AlertTriangle size={14} color={c.ring} style={{flexShrink:0}}/>
+              <div style={{flex:1,minWidth:0,overflow:"hidden"}}>
+                <p style={{fontSize:13,fontWeight:500,color:"#fff",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",margin:0}}>{dl.title}</p>
+                {dl.subject&&<p style={{fontSize:10,color:"#666",marginTop:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{dl.subject}</p>}
               </div>
               <span style={{fontSize:11,color:c.text,whiteSpace:"nowrap",fontWeight:600,flexShrink:0}}>{dlBadgeLabel(daysLeft)}</span>
             </div>
           );
         })}
+        {overflow>0&&(
+          <div style={{padding:"8px 12px",borderRadius:14,background:"#111",border:"1px solid #1e1e1e",textAlign:"center"}}>
+            <span style={{fontSize:12,color:"#888"}}>+{overflow} more deadline{overflow>1?"s":""} this week — see Deadlines tab</span>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -816,15 +904,14 @@ function NotifSettings({reminderTime,setReminderTime,notifStatus,onRequestPermis
   }[notifStatus]||{icon:Bell,color:"#555",label:"Unknown"};
   const StatusIcon=statusInfo.icon;
   function sendTestNotif() {
-    const today=new Date();
-    const due=tasks.filter(t=>isDueOn(t,today));
+    const today = new Date();
+    const { due, urgentDeadlines } = buildDailyNotificationPayload(tasks, deadlines, today);
     if (due.length>0) fireNotification(`GroomFlow — ${due.length} routine${due.length>1?"s":""} today`,due.map(t=>`• ${t.name}`).join("\n"));
     else fireNotification("GroomFlow","No routines today — enjoy your rest! 🎉");
-    const urgentDl=deadlines.filter(d=>!d.done&&daysUntilDeadline(d.date,today)<=7)[0];
-    if (urgentDl) {
-      const daysLeft=daysUntilDeadline(urgentDl.date,today);
-      setTimeout(()=>fireNotification(`⏰ Deadline: ${urgentDl.title}`,`${dlBadgeLabel(daysLeft)} — ${urgentDl.subject||"Assignment"}`),1000);
-    }
+    urgentDeadlines.slice(0,3).forEach((dl,i)=>{
+      const daysLeft=daysUntilDeadline(dl.date,today);
+      setTimeout(()=>fireNotification(`⏰ Deadline: ${dl.title}`,`${dlBadgeLabel(daysLeft)} — ${dl.subject||"Assignment"}`),700*(i+1));
+    });
   }
   return (
     <div style={{display:"flex",flexDirection:"column",gap:16}}>
@@ -853,7 +940,13 @@ function NotifSettings({reminderTime,setReminderTime,notifStatus,onRequestPermis
       <div style={{borderRadius:16,padding:14,background:"#111",border:"1px solid #1e1e1e"}}>
         <p style={{fontSize:11,color:"#666",lineHeight:1.7}}>
           <span style={{color:"#888",fontWeight:600}}>Deadline alerts: </span>
-          Any deadline within 7 days triggers a daily notification until it passes.
+          Any deadline within 7 days triggers a notification — at most once per day.
+        </p>
+        <p style={{fontSize:11,color:"#666",lineHeight:1.7,marginTop:8}}>
+          <span style={{color:"#888",fontWeight:600}}>Note: </span>
+          Browser notifications can only fire while GroomFlow is open or freshly reopened —
+          Android can't run background timers for web apps. Opening the app once a day
+          (even briefly) is enough to trigger that day's reminder.
         </p>
       </div>
     </div>
@@ -889,9 +982,30 @@ export default function App() {
 
   useEffect(()=>{
     if (notifStatus!=="granted") return;
+
+    // 1. Check immediately on mount/whenever inputs change — catches the case
+    //    where the reminder time already passed today and the app was closed
+    //    when it should have fired (this was the main reason notifications
+    //    "didn't show up").
+    checkAndFireIfReminderDue(reminderTime, tasks, deadlines);
+
+    // 2. Re-check every time the app/tab becomes visible again (re-opened from
+    //    background, phone unlocked, switched back from another app).
+    function onVisible() {
+      if (document.visibilityState === "visible") {
+        checkAndFireIfReminderDue(reminderTime, tasks, deadlines);
+      }
+    }
+    document.addEventListener("visibilitychange", onVisible);
+
+    // 3. Keep a live timer as a bonus for same-session exact-time firing.
     if (timerRef.current) clearTimeout(timerRef.current);
-    timerRef.current=scheduleDailyReminder(reminderTime,tasks,deadlines);
-    return ()=>{ if(timerRef.current) clearTimeout(timerRef.current); };
+    timerRef.current = scheduleDailyReminder(reminderTime, tasks, deadlines);
+
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
   },[notifStatus,reminderTime,tasks,deadlines]);
 
   async function handleRequestPermission() { const r=await requestNotifPermission(); setNotifStatus(r); }
